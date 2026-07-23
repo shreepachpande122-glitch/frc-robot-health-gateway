@@ -8,48 +8,38 @@ PORT = 1883
 TOPIC = "shree/frc/robot548/telemetry"
 
 
-def on_connect(
-    client: mqtt.Client,
-    userdata,
-    flags,
-    reason_code,
-    properties,
-) -> None:
+def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         print("Connected to the MQTT broker.")
         client.subscribe(TOPIC)
         print(f"Listening on {TOPIC}")
     else:
-        print(f"Connection failed. Reason code: {reason_code}")
+        print(f"Connection failed: {reason_code}")
 
 
-def on_message(
-    client: mqtt.Client,
-    userdata,
-    message: mqtt.MQTTMessage,
-) -> None:
+def on_message(client, userdata, message):
     try:
-        decoded_message = message.payload.decode("utf-8")
-        telemetry = json.loads(decoded_message)
+        telemetry = json.loads(message.payload.decode("utf-8"))
 
         print("\nReceived telemetry")
         print(f"Source: {telemetry.get('source')}")
-        print(f"Mode: {telemetry.get('robot_mode')}")
-        print(f"Battery: {telemetry.get('battery_voltage')} V")
-        print(f"Current: {telemetry.get('drive_current_amps')} A")
-        print(f"Temperature: {telemetry.get('motor_temperature_c')} C")
-        print(f"Speed: {telemetry.get('robot_speed_mps')} m/s")
-
-    except UnicodeDecodeError:
-        print("Received a message that was not valid text.")
+        print(f"Timestamp: {telemetry.get('timestamp_seconds')} s")
+        print(f"X position: {telemetry.get('robot_position_x_m')} m")
+        print(f"Y position: {telemetry.get('robot_position_y_m')} m")
+        print(f"Heading: {telemetry.get('robot_heading_rad')} rad")
+        print(f"X velocity: {telemetry.get('robot_velocity_x_mps')} m/s")
+        print(f"Y velocity: {telemetry.get('robot_velocity_y_mps')} m/s")
+        print(
+            "Angular velocity: "
+            f"{telemetry.get('robot_angular_velocity_radps')} rad/s"
+        )
 
     except json.JSONDecodeError:
-        print("Received a message that was not valid JSON.")
+        print("Received invalid JSON.")
 
 
-def main() -> None:
+def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-
     client.on_connect = on_connect
     client.on_message = on_message
 
