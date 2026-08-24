@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+logs/
+*.wpilog
+.vscode/
+.env
+robot_log_data.csv

@@ -1,507 +1,333 @@
-import math
-import mmap
-import struct
+import glob
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
-# Exact name of your attached log file
-LOG_NAME = "FRC_20250315_163507_MIBKN_Q12.wpilog"
-
-# This finds the log in the same folder as this Python file
-LOG_FILE = Path(__file__).resolve().parent / LOG_NAME
-
-POSE_TOPIC = "NT:/DriveState/Pose"
-SPEEDS_TOPIC = "NT:/DriveState/Speeds"
-ENABLED_TOPIC = "DS:enabled"
+# Folder containing this Python file
+PROJECT_FOLDER = Path(__file__).resolve().parent
 
 
-def read_string(payload, position):
-    length = int.from_bytes(
-        payload[position:position + 4],
-        "little"
+def load_all_csv_files():
+    csv_files = list(PROJECT_FOLDER.glob("*.csv"))
+
+    if not csv_files:
+        print("No CSV files found.")
+        print("Put your robot CSV files in the same folder as this Python file.")
+        return []
+
+    datasets = []
+
+    for file_path in csv_files:
+        try:
+            df = pd.read_csv(file_path)
+
+            print()
+            print(f"Loaded: {file_path.name}")
+            print(f"Rows: {len(df)}")
+
+            datasets.append((file_path.name, df))
+
+        except Exception as e:
+            print(f"Could not read {file_path.name}: {e}")
+
+    return datasets
+
+
+def clean_data(df):
+    # Convert the time column into elapsed seconds
+    if "Time" in df.columns:
+        parsed_time = pd.to_datetime(
+            df["Time"],
+            format="%H:%M:%S.%f",
+            errors="coerce"
+        )
+
+        if parsed_time.notna().any():
+            start_time = parsed_time.iloc[0]
+
+            df["Elapsed Time"] = (
+                parsed_time - start_time
+            ).dt.total_seconds()
+
+        else:
+            df["Elapsed Time"] = range(len(df))
+
+    else:
+        df["Elapsed Time"] = range(len(df))
+
+    # Remove clearly impossible battery voltage values
+    if "Voltage" in df.columns:
+        df.loc[
+            (df["Voltage"] < 0)
+            | (df["Voltage"] > 20),
+            "Voltage"
+        ] = float("nan")
+
+    return df
+
+
+def graph_battery_voltage(df, name):
+    if "Voltage" not in df.columns:
+        return
+
+    plt.figure()
+
+    plt.plot(
+        df["Elapsed Time"],
+        df["Voltage"]
     )
 
-    position += 4
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Battery Voltage (V)")
+    plt.title(f"Battery Voltage - {name}")
 
-    text = payload[
-        position:position + length
-    ].decode("utf-8", errors="replace")
-
-    return text, position + length
-
-
-def read_start_record(payload):
-    # Bytes 1 through 4 contain the new NetworkTables entry ID
-    entry_id = int.from_bytes(payload[1:5], "little")
-
-    position = 5
-
-    topic_name, position = read_string(payload, position)
-
-    return entry_id, topic_name
+    plt.grid(True)
+    plt.tight_layout()
 
 
-def iter_records(file_path):
-    """
-    Reads each record from the WPILib log.
+def graph_total_current(df, name):
+    if "Total PDP" not in df.columns:
+        return
 
-    Returns:
-        entry ID
-        timestamp in seconds
-        raw payload
-    """
+    plt.figure()
 
-    with file_path.open("rb") as file:
-        with mmap.mmap(
-            file.fileno(),
-            0,
-            access=mmap.ACCESS_READ
-        ) as log:
-
-            if len(log) < 12 or log[:6] != b"WPILOG":
-                raise ValueError(
-                    "This is not a valid WPILib .wpilog file."
-                )
-
-            extra_header_length = int.from_bytes(
-                log[8:12],
-                "little"
-            )
-
-            position = 12 + extra_header_length
-
-            while position < len(log):
-                header = log[position]
-
-                entry_length = (header & 0x03) + 1
-                size_length = ((header >> 2) & 0x03) + 1
-                timestamp_length = ((header >> 4) & 0x07) + 1
-
-                header_length = (
-                    1
-                    + entry_length
-                    + size_length
-                    + timestamp_length
-                )
-
-                if position + header_length > len(log):
-                    break
-
-                entry_start = position + 1
-                size_start = entry_start + entry_length
-                timestamp_start = size_start + size_length
-
-                entry_id = int.from_bytes(
-                    log[entry_start:size_start],
-                    "little"
-                )
-
-                payload_size = int.from_bytes(
-                    log[size_start:timestamp_start],
-                    "little"
-                )
-
-                timestamp_microseconds = int.from_bytes(
-                    log[
-                        timestamp_start:
-                        timestamp_start + timestamp_length
-                    ],
-                    "little"
-                )
-
-                payload_start = position + header_length
-                payload_end = payload_start + payload_size
-
-                if payload_end > len(log):
-                    break
-
-                payload = log[payload_start:payload_end]
-
-                timestamp_seconds = (
-                    timestamp_microseconds / 1_000_000
-                )
-
-                yield entry_id, timestamp_seconds, payload
-
-                position = payload_end
-
-
-def find_longest_enabled_interval(events, final_time):
-    """
-    Finds the longest time period where the robot was enabled.
-    This removes most disabled time before and after the match.
-    """
-
-    intervals = []
-    start_time = None
-
-    for timestamp, enabled in sorted(events):
-        if enabled and start_time is None:
-            start_time = timestamp
-
-        elif not enabled and start_time is not None:
-            intervals.append((start_time, timestamp))
-            start_time = None
-
-    if start_time is not None:
-        intervals.append((start_time, final_time))
-
-    if not intervals:
-        return None
-
-    return max(
-        intervals,
-        key=lambda interval: interval[1] - interval[0]
+    plt.plot(
+        df["Elapsed Time"],
+        df["Total PDP"]
     )
 
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Total Current (A)")
+    plt.title(f"Total PDP Current - {name}")
 
-def add_time_gaps(times, values, maximum_gap=0.15):
-    """
-    Adds blank breaks when there is a large gap between samples.
-    This prevents unrelated sections from being connected.
-    """
-
-    graph_times = []
-    graph_values = []
-
-    previous_time = None
-
-    for timestamp, value in zip(times, values):
-        if (
-            previous_time is not None
-            and timestamp - previous_time > maximum_gap
-        ):
-            graph_times.append(float("nan"))
-            graph_values.append(float("nan"))
-
-        graph_times.append(timestamp)
-        graph_values.append(value)
-
-        previous_time = timestamp
-
-    return graph_times, graph_values
+    plt.grid(True)
+    plt.tight_layout()
 
 
-def add_path_gaps(
-    times,
-    x_values,
-    y_values,
-    maximum_time_gap=0.15,
-    maximum_position_jump=1.0
-):
-    """
-    Breaks the path line when the pose suddenly jumps.
-    Pose jumps can happen because of odometry or vision resets.
-    """
+def graph_cpu(df, name):
+    if "roboRIO CPU" not in df.columns:
+        return
 
-    graph_x = []
-    graph_y = []
+    plt.figure()
 
-    previous_time = None
-    previous_x = None
-    previous_y = None
+    plt.plot(
+        df["Elapsed Time"],
+        df["roboRIO CPU"]
+    )
 
-    for timestamp, x_value, y_value in zip(
-        times,
-        x_values,
-        y_values
-    ):
-        break_line = False
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("CPU Usage (%)")
+    plt.title(f"roboRIO CPU Usage - {name}")
 
-        if previous_time is not None:
-            time_gap = timestamp - previous_time
+    plt.grid(True)
+    plt.tight_layout()
 
-            position_jump = math.hypot(
-                x_value - previous_x,
-                y_value - previous_y
+
+def graph_can(df, name):
+    if "CAN" not in df.columns:
+        return
+
+    plt.figure()
+
+    plt.plot(
+        df["Elapsed Time"],
+        df["CAN"]
+    )
+
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("CAN Utilization (%)")
+    plt.title(f"CAN Utilization - {name}")
+
+    plt.grid(True)
+    plt.tight_layout()
+
+
+def graph_pdp_channels(df, name):
+    pdp_columns = [
+        column
+        for column in df.columns
+        if column.startswith("PDP ")
+    ]
+
+    if not pdp_columns:
+        return
+
+    # Only graph channels that actually have current
+    active_channels = []
+
+    for column in pdp_columns:
+        if df[column].abs().max() > 0.5:
+            active_channels.append(column)
+
+    if not active_channels:
+        print(f"No active PDP channels found in {name}")
+        return
+
+    plt.figure(figsize=(12, 6))
+
+    for column in active_channels:
+        plt.plot(
+            df["Elapsed Time"],
+            df[column],
+            label=column
+        )
+
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Current (A)")
+    plt.title(f"Active PDP Channels - {name}")
+
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+
+def graph_brownout(df, name):
+    if "Brownout" not in df.columns:
+        return
+
+    plt.figure()
+
+    plt.step(
+        df["Elapsed Time"],
+        df["Brownout"].astype(int),
+        where="post"
+    )
+
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Brownout")
+    plt.title(f"Brownout Status - {name}")
+
+    plt.yticks(
+        [0, 1],
+        ["Normal", "Brownout"]
+    )
+
+    plt.grid(True)
+    plt.tight_layout()
+
+
+def graph_watchdog(df, name):
+    if "Watchdog" not in df.columns:
+        return
+
+    plt.figure()
+
+    plt.step(
+        df["Elapsed Time"],
+        df["Watchdog"].astype(int),
+        where="post"
+    )
+
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Watchdog")
+    plt.title(f"Watchdog Status - {name}")
+
+    plt.yticks(
+        [0, 1],
+        ["Normal", "Triggered"]
+    )
+
+    plt.grid(True)
+    plt.tight_layout()
+
+
+def print_summary(df, name):
+    print()
+    print(f"----- {name} -----")
+
+    if "Voltage" in df.columns:
+        valid_voltage = df["Voltage"].dropna()
+
+        if not valid_voltage.empty:
+            print(
+                f"Battery voltage: "
+                f"{valid_voltage.min():.2f} - "
+                f"{valid_voltage.max():.2f} V"
             )
 
-            if time_gap > maximum_time_gap:
-                break_line = True
+    if "Total PDP" in df.columns:
+        print(
+            f"Maximum total current: "
+            f"{df['Total PDP'].max():.2f} A"
+        )
 
-            if position_jump > maximum_position_jump:
-                break_line = True
+    if "roboRIO CPU" in df.columns:
+        print(
+            f"Maximum roboRIO CPU: "
+            f"{df['roboRIO CPU'].max():.1f}%"
+        )
 
-        if break_line:
-            graph_x.append(float("nan"))
-            graph_y.append(float("nan"))
+    if "CAN" in df.columns:
+        print(
+            f"Maximum CAN utilization: "
+            f"{df['CAN'].max():.1f}%"
+        )
 
-        graph_x.append(x_value)
-        graph_y.append(y_value)
+    if "Brownout" in df.columns:
+        brownouts = int(df["Brownout"].sum())
 
-        previous_time = timestamp
-        previous_x = x_value
-        previous_y = y_value
+        print(
+            f"Brownout samples: {brownouts}"
+        )
 
-    return graph_x, graph_y
+    if "Watchdog" in df.columns:
+        watchdogs = int(df["Watchdog"].sum())
+
+        print(
+            f"Watchdog samples: {watchdogs}"
+        )
 
 
 def main():
-    if not LOG_FILE.exists():
-        print(f"Could not find {LOG_NAME}")
-        print(
-            "Put the .wpilog file in the same folder "
-            "as this Python file."
-        )
+    datasets = load_all_csv_files()
+
+    if not datasets:
         return
 
-    entry_names = {}
+    for file_name, df in datasets:
+        df = clean_data(df)
 
-    enabled_events = []
-    pose_samples = []
-    speed_samples = []
-
-    final_time = 0.0
-
-    print(f"Reading {LOG_NAME}...")
-
-    for entry_id, timestamp, payload in iter_records(LOG_FILE):
-        final_time = max(final_time, timestamp)
-
-        # Entry 0 contains control records and topic definitions
-        if entry_id == 0:
-            # Control type 0 means a topic is being created
-            if payload and payload[0] == 0:
-                try:
-                    new_entry_id, topic_name = read_start_record(
-                        payload
-                    )
-
-                    entry_names[new_entry_id] = topic_name
-
-                except (IndexError, UnicodeDecodeError):
-                    pass
-
-            continue
-
-        topic_name = entry_names.get(entry_id)
-
-        # Pose2d contains three doubles:
-        # x position, y position, heading
-        if topic_name == POSE_TOPIC and len(payload) >= 24:
-            x, y, heading = struct.unpack(
-                "<ddd",
-                payload[:24]
-            )
-
-            pose_samples.append(
-                (timestamp, x, y, heading)
-            )
-
-        # ChassisSpeeds contains three doubles:
-        # vx, vy, omega
-        elif topic_name == SPEEDS_TOPIC and len(payload) >= 24:
-            vx, vy, omega = struct.unpack(
-                "<ddd",
-                payload[:24]
-            )
-
-            speed_samples.append(
-                (timestamp, vx, vy, omega)
-            )
-
-        elif topic_name == ENABLED_TOPIC and payload:
-            enabled = payload[0] != 0
-
-            enabled_events.append(
-                (timestamp, enabled)
-            )
-
-    print(f"Pose samples found: {len(pose_samples):,}")
-    print(f"Speed samples found: {len(speed_samples):,}")
-
-    if not pose_samples:
-        print("No DriveState pose data was found.")
-        return
-
-    if not speed_samples:
-        print("No DriveState speed data was found.")
-        return
-
-    enabled_interval = find_longest_enabled_interval(
-        enabled_events,
-        final_time
-    )
-
-    if enabled_interval is not None:
-        start_time, end_time = enabled_interval
-
-        print(
-            "Using longest enabled period: "
-            f"{end_time - start_time:.1f} seconds"
+        print_summary(
+            df,
+            file_name
         )
 
-        pose_samples = [
-            sample
-            for sample in pose_samples
-            if start_time <= sample[0] <= end_time
-        ]
-
-        speed_samples = [
-            sample
-            for sample in speed_samples
-            if start_time <= sample[0] <= end_time
-        ]
-
-    else:
-        start_time = min(
-            pose_samples[0][0],
-            speed_samples[0][0]
+        graph_battery_voltage(
+            df,
+            file_name
         )
 
-        print(
-            "No enabled-state data was found. "
-            "Using the entire log."
+        graph_total_current(
+            df,
+            file_name
         )
 
-    if not pose_samples or not speed_samples:
-        print("No samples remained after filtering.")
-        return
-
-    pose_times = [
-        sample[0] - start_time
-        for sample in pose_samples
-    ]
-
-    x_positions = [
-        sample[1]
-        for sample in pose_samples
-    ]
-
-    y_positions = [
-        sample[2]
-        for sample in pose_samples
-    ]
-
-    headings = [
-        sample[3]
-        for sample in pose_samples
-    ]
-
-    speed_times = [
-        sample[0] - start_time
-        for sample in speed_samples
-    ]
-
-    x_velocities = [
-        sample[1]
-        for sample in speed_samples
-    ]
-
-    y_velocities = [
-        sample[2]
-        for sample in speed_samples
-    ]
-
-    angular_velocities = [
-        sample[3]
-        for sample in speed_samples
-    ]
-
-    speeds = [
-        math.hypot(vx, vy)
-        for vx, vy in zip(
-            x_velocities,
-            y_velocities
+        graph_cpu(
+            df,
+            file_name
         )
-    ]
 
-    path_x, path_y = add_path_gaps(
-        pose_times,
-        x_positions,
-        y_positions
-    )
+        graph_can(
+            df,
+            file_name
+        )
 
-    graph_speed_times, graph_speeds = add_time_gaps(
-        speed_times,
-        speeds
-    )
+        graph_pdp_channels(
+            df,
+            file_name
+        )
 
-    graph_heading_times, graph_headings = add_time_gaps(
-        pose_times,
-        headings
-    )
+        graph_brownout(
+            df,
+            file_name
+        )
 
-    graph_omega_times, graph_omega = add_time_gaps(
-        speed_times,
-        angular_velocities
-    )
-
-    output_folder = Path(__file__).resolve().parent
-
-    # Robot path graph
-    plt.figure()
-    plt.plot(path_x, path_y)
-    plt.xlabel("X position (meters)")
-    plt.ylabel("Y position (meters)")
-    plt.title("FRC Robot Path")
-    plt.axis("equal")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(
-        output_folder / "robot_path.png",
-        dpi=160
-    )
-
-    # Speed graph
-    plt.figure()
-    plt.plot(graph_speed_times, graph_speeds)
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Speed (meters per second)")
-    plt.title("Robot Speed Over Time")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(
-        output_folder / "robot_speed.png",
-        dpi=160
-    )
-
-    # Heading graph
-    plt.figure()
-    plt.plot(graph_heading_times, graph_headings)
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Heading (radians)")
-    plt.title("Robot Heading Over Time")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(
-        output_folder / "robot_heading.png",
-        dpi=160
-    )
-
-    # Angular velocity graph
-    plt.figure()
-    plt.plot(graph_omega_times, graph_omega)
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Angular velocity (radians per second)")
-    plt.title("Robot Angular Velocity Over Time")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(
-        output_folder / "robot_angular_velocity.png",
-        dpi=160
-    )
-
-    print()
-    print(
-        f"Enabled pose samples graphed: "
-        f"{len(pose_samples):,}"
-    )
-
-    print(
-        f"Enabled speed samples graphed: "
-        f"{len(speed_samples):,}"
-    )
-
-    print(f"Maximum speed: {max(speeds):.2f} m/s")
-
-    print()
-    print("Saved robot_path.png")
-    print("Saved robot_speed.png")
-    print("Saved robot_heading.png")
-    print("Saved robot_angular_velocity.png")
+        graph_watchdog(
+            df,
+            file_name
+        )
 
     plt.show()
 
